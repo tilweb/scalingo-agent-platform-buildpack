@@ -14,9 +14,10 @@ BUILD_DIR=${1:-}
 CACHE_DIR=${2:-}
 ENV_DIR=${3:-}
 
-# Beide Versionen hardcoded — Updates via Buildpack-Commit + neuen Tag.
+# Versionen hardcoded — Updates via Buildpack-Commit + neuen Tag.
 BUN_VERSION="1.3.7"
 NODE_VERSION="20.18.0"   # Node 20 LTS, Vite 7 + Frontend-Deps kompatibel
+FFMPEG_VERSION="release" # johnvansickle static build — immer aktuelle stable
 
 # === Scalingo-ENV-Vars in den Build-Prozess exportieren ===
 # Scalingo legt jede App-ENV-Var als File in $ENV_DIR ab — wir machen daraus
@@ -59,6 +60,22 @@ fi
 export PATH="$NODE_INSTALL_DIR/bin:$PATH"
 echo "       node=$(node --version), npm=$(npm --version)"
 
+# === ffmpeg statisches Binary installieren ===
+# apt-Paket-ffmpeg auf Ubuntu 22.04 hat Soft-Dependencies auf pulseaudio
+# 16.x die nicht standardmaessig im Stack-Image sind — Crash-Loading mit
+# "libpulsecommon-16.1.so: cannot open shared object". Statisches Binary
+# (johnvansickle.com) hat keine System-Lib-Abhaengigkeiten und ist von
+# vielen Production-Setups eingesetzt.
+FFMPEG_DIR="$CACHE_DIR/ffmpeg-$FFMPEG_VERSION"
+if [ ! -x "$FFMPEG_DIR/ffmpeg" ]; then
+  echo "-----> Installing ffmpeg ($FFMPEG_VERSION static)"
+  mkdir -p "$FFMPEG_DIR"
+  curl -fsSL "https://johnvansickle.com/ffmpeg/releases/ffmpeg-${FFMPEG_VERSION}-amd64-static.tar.xz" \
+    | tar -xJ --strip-components=1 -C "$FFMPEG_DIR"
+else
+  echo "-----> ffmpeg ($FFMPEG_VERSION static, cached)"
+fi
+
 # === Bun installieren ===
 BUN_INSTALL_DIR="$CACHE_DIR/bun-$BUN_VERSION"
 if [ ! -x "$BUN_INSTALL_DIR/bin/bun" ]; then
@@ -89,17 +106,21 @@ cd "$BUILD_DIR/backend"
 bun install --frozen-lockfile --production
 echo "       Backend dependencies installed"
 
-# === Bun in den Slug kopieren ===
+# === Binaries in den Slug kopieren ===
 # Sonst nicht zur Runtime verfuegbar (Cache liegt ausserhalb /app nach Slug-Move).
 mkdir -p "$BUILD_DIR/.bun/bin"
 cp "$BUN_INSTALL_DIR/bin/bun" "$BUILD_DIR/.bun/bin/bun"
+
+mkdir -p "$BUILD_DIR/.ffmpeg/bin"
+cp "$FFMPEG_DIR/ffmpeg" "$BUILD_DIR/.ffmpeg/bin/ffmpeg"
+cp "$FFMPEG_DIR/ffprobe" "$BUILD_DIR/.ffmpeg/bin/ffprobe"
 
 # === Profile.d-Script: Runtime-Setup ===
 # Scalingo source-t /app/.profile.d/*.sh beim Container-Start.
 mkdir -p "$BUILD_DIR/.profile.d"
 cat > "$BUILD_DIR/.profile.d/agent-platform.sh" <<'PROFILE_EOF'
-# Bun in PATH
-export PATH="/app/.bun/bin:$PATH"
+# Bun + ffmpeg in PATH
+export PATH="/app/.bun/bin:/app/.ffmpeg/bin:$PATH"
 
 # Postgres-ENV-Aliasing: Scalingo setzt SCALINGO_POSTGRESQL_URL, unser
 # Code liest SCALINGO_POSTGRES. Sicherheits-Aliasing in beide Richtungen,
