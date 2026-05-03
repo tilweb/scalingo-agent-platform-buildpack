@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Release: Default-Process-Types fuer den Procfile-Fallback. App-Repo kann
+# einen eigenen Procfile mitliefern, der gewinnt.
+cat <<EOF
+---
+default_process_types:
+  web: cd backend && bun run src/index.ts
+EOF

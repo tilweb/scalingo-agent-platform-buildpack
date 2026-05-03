@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Compile: installiert Bun und Node (gepinnt) im Build-Cache, baut Frontend
+# (Vite), installiert Backend-Deps (Bun), kopiert Bun-Binary in den Slug,
+# legt .profile.d-Script fuer Runtime-Setup an, raeumt frontend/node_modules
+# auf (Slug-Optimierung).
+#
+# Args:
+#   $1 = BUILD_DIR (App-Code, landet zur Runtime unter /app)
+#   $2 = CACHE_DIR (persistent zwischen Builds)
+#   $3 = ENV_DIR   (eine Datei pro App-ENV-Var)
+set -eu
+
+BUILD_DIR=${1:-}
+CACHE_DIR=${2:-}
+ENV_DIR=${3:-}
+
+# Beide Versionen hardcoded — Updates via Buildpack-Commit + neuen Tag.
+BUN_VERSION="1.3.7"
+NODE_VERSION="20.18.0"   # Node 20 LTS, Vite 7 + Frontend-Deps kompatibel
+
+# === Scalingo-ENV-Vars in den Build-Prozess exportieren ===
+# Scalingo legt jede App-ENV-Var als File in $ENV_DIR ab — wir machen daraus
+# echte Shell-Vars, damit npm/Bun sie nutzen koennen (z.B. fuer NPM_TOKEN
+# bei Private-Registries oder VITE_*-Build-Vars).
+if [ -d "$ENV_DIR" ]; then
+  for var in $(ls "$ENV_DIR"); do
+    export "$var=$(cat "$ENV_DIR/$var")"
+  done
+fi
+
+# === Postgres-ENV normalisieren (build-time) ===
+# Scalingo setzt SCALINGO_POSTGRESQL_URL, unser Code liest SCALINGO_POSTGRES.
+# Aliasing in beide Richtungen damit Drizzle-Tools (DATABASE_URL) und
+# unser Code (SCALINGO_POSTGRES) zufrieden sind. Selbe Logik landet
+# auch im .profile.d-Script fuer die Runtime.
+if [ -z "${SCALINGO_POSTGRES:-}" ]; then
+  if [ -n "${SCALINGO_POSTGRESQL_URL:-}" ]; then
+    export SCALINGO_POSTGRES="$SCALINGO_POSTGRESQL_URL"
+  elif [ -n "${DATABASE_URL:-}" ]; then
+    export SCALINGO_POSTGRES="$DATABASE_URL"
+  fi
+fi
+if [ -z "${DATABASE_URL:-}" ] && [ -n "${SCALINGO_POSTGRES:-}" ]; then
+  export DATABASE_URL="$SCALINGO_POSTGRES"
+fi
+
+# === Node installieren ===
+# scalingo-22 = Ubuntu 22.04 + Standard-Tools. Node ist NICHT garantiert
+# vorhanden — wir installieren es selbst (gepinnte Version).
+NODE_INSTALL_DIR="$CACHE_DIR/node-$NODE_VERSION"
+if [ ! -x "$NODE_INSTALL_DIR/bin/node" ]; then
+  echo "-----> Installing Node $NODE_VERSION"
+  mkdir -p "$NODE_INSTALL_DIR"
+  curl -fsSL "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.xz" \
+    | tar -xJ --strip-components=1 -C "$NODE_INSTALL_DIR"
+else
+  echo "-----> Node $NODE_VERSION (cached)"
+fi
+export PATH="$NODE_INSTALL_DIR/bin:$PATH"
+echo "       node=$(node --version), npm=$(npm --version)"
+
+# === Bun installieren ===
+BUN_INSTALL_DIR="$CACHE_DIR/bun-$BUN_VERSION"
+if [ ! -x "$BUN_INSTALL_DIR/bin/bun" ]; then
+  echo "-----> Installing Bun $BUN_VERSION"
+  mkdir -p "$BUN_INSTALL_DIR"
+  curl -fsSL "https://bun.sh/install" \
+    | BUN_INSTALL="$BUN_INSTALL_DIR" bash -s "bun-v$BUN_VERSION"
+else
+  echo "-----> Bun $BUN_VERSION (cached)"
+fi
+export PATH="$BUN_INSTALL_DIR/bin:$PATH"
+
+# === Frontend bauen (Node + npm) ===
+echo "-----> Building Frontend"
+cd "$BUILD_DIR/frontend"
+npm ci --no-audit --no-fund
+npm run build
+echo "       Frontend built to frontend/dist/"
+
+# Slug-Optimierung: Frontend-node_modules zur Runtime nicht gebraucht
+# (Backend serviert dist/ als statische Files via serveStatic).
+echo "-----> Removing frontend/node_modules (build artifact, ~200 MB)"
+rm -rf "$BUILD_DIR/frontend/node_modules"
+
+# === Backend-Deps installieren (Bun) ===
+echo "-----> Installing Backend dependencies"
+cd "$BUILD_DIR/backend"
+bun install --frozen-lockfile --production
+echo "       Backend dependencies installed"
+
+# === Bun in den Slug kopieren ===
+# Sonst nicht zur Runtime verfuegbar (Cache liegt ausserhalb /app nach Slug-Move).
+mkdir -p "$BUILD_DIR/.bun/bin"
+cp "$BUN_INSTALL_DIR/bin/bun" "$BUILD_DIR/.bun/bin/bun"
+
+# === Profile.d-Script: Runtime-Setup ===
+# Scalingo source-t /app/.profile.d/*.sh beim Container-Start.
+mkdir -p "$BUILD_DIR/.profile.d"
+cat > "$BUILD_DIR/.profile.d/agent-platform.sh" <<'PROFILE_EOF'
+# Bun in PATH
+export PATH="/app/.bun/bin:$PATH"
+
+# Postgres-ENV-Aliasing: Scalingo setzt SCALINGO_POSTGRESQL_URL, unser
+# Code liest SCALINGO_POSTGRES. Sicherheits-Aliasing in beide Richtungen,
+# damit alle Konsumenten (Drizzle-CLI = DATABASE_URL, unser Code =
+# SCALINGO_POSTGRES) ihren Connection-String finden.
+if [ -z "${SCALINGO_POSTGRES:-}" ]; then
+  if [ -n "${SCALINGO_POSTGRESQL_URL:-}" ]; then
+    export SCALINGO_POSTGRES="$SCALINGO_POSTGRESQL_URL"
+  elif [ -n "${DATABASE_URL:-}" ]; then
+    export SCALINGO_POSTGRES="$DATABASE_URL"
+  fi
+fi
+if [ -z "${DATABASE_URL:-}" ] && [ -n "${SCALINGO_POSTGRES:-}" ]; then
+  export DATABASE_URL="$SCALINGO_POSTGRES"
+fi
+PROFILE_EOF
+
+echo "-----> Build successful"

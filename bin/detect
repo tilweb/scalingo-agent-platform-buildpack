@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Detect: erkennt unser App-Layout (backend/ + frontend/ + bun.lock).
+set -e
+
+BUILD_DIR=${1:-}
+
+if [ -f "$BUILD_DIR/backend/package.json" ] \
+  && [ -f "$BUILD_DIR/frontend/package.json" ] \
+  && [ -f "$BUILD_DIR/backend/bun.lock" ]; then
+  echo "Agent Platform"
+  exit 0
+fi
+
+exit 1
